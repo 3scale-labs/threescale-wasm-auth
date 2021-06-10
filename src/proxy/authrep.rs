@@ -15,7 +15,7 @@ use threescalers::{
 };
 
 #[derive(Debug, thiserror::Error)]
-enum MatchError {
+pub enum MatchError {
     #[error("no known service matched")]
     NoServiceMatched,
     #[error("credentials error")]

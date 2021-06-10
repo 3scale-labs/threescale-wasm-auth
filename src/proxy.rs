@@ -7,6 +7,8 @@ use proxy_wasm::traits::{Context, HttpContext, RootContext};
 use proxy_wasm::types::{BufferType, ChildContext, FilterHeadersStatus, LogLevel};
 
 use crate::{configuration::Configuration, util::serde::ErrorLocation};
+use request_headers::RequestHeaders;
+use threescalers::{application::Application, http::mapping_rule::Method};
 
 pub struct HttpAuthThreescale {
     context_id: u32,
@@ -33,7 +35,21 @@ impl HttpContext for HttpAuthThreescale {
 
         let backend = self.configuration().get_backend().ok();
 
-        let rh = request_headers::RequestHeaders::new(self);
+        let rh = RequestHeaders::new(self);
+
+        let pass_request: bool = self.configuration().pass_request.unwrap_or(false);
+
+        if pass_request {
+            match self.threescale_info_to_metadata(&rh) {
+                Ok(()) => return FilterHeadersStatus::Continue,
+                Err(e) => {
+                    error!("failed to pass app info to next filter: {:?}", e);
+                    self.send_http_response(403, vec![], Some(b"Access forbidden.\n"));
+                    info!("threescale_wasm_auth: 403 sent");
+                    return FilterHeadersStatus::StopIteration;
+                }
+            }
+        }
 
         let ar = match authrep::authrep(self, &rh) {
             Err(e) => {
@@ -234,6 +250,78 @@ impl RootContext for RootAuthThreescale {
         };
 
         Some(ChildContext::HttpContext(Box::new(ctx)))
+    }
+}
+
+impl HttpAuthThreescale {
+    fn threescale_info_to_metadata(&self, rh: &RequestHeaders) -> Result<(), anyhow::Error> {
+        let metadata = rh.metadata();
+        let method = Method::from(metadata.method());
+        let url = rh.url()?;
+        let authority = url.authority();
+        let path = url.path();
+        let mut pattern = path.to_string();
+        let qs = url.query();
+        if let Some(qs) = qs {
+            pattern.push('?');
+            pattern.push_str(qs);
+        }
+
+        let svclist = self.configuration().get_services()?;
+        let service = svclist
+            .iter()
+            .find(|&svc| svc.match_authority(authority))
+            .ok_or(authrep::MatchError::NoServiceMatched)?;
+        let credentials = service.credentials();
+
+        let apps = credentials.resolve(self, rh, &url)?;
+
+        if apps.is_empty() {
+            anyhow::bail!("could not extract application credentials");
+        }
+
+        if apps.len() > 1 {
+            debug!(
+                "found more than one source match for application - going to send {:?}",
+                apps[0]
+            );
+        }
+        let mut app_id_key = String::new();
+        let key_header = match &apps[0] {
+            Application::AppId(app_id, app_key) => {
+                app_id_key.push_str(app_id.as_ref());
+                app_id_key.push(':');
+                if let Some(key) = app_key {
+                    app_id_key.push_str(key.as_ref());
+                }
+                vec!["x-3scale-app-id", app_id_key.as_str()]
+            }
+            Application::UserKey(user_key) => vec!["x-3scale-user-key", user_key.as_ref()],
+            Application::OAuthToken(token) => vec!["x-3scale-oauth-token", token.as_ref()],
+        };
+
+        let mut usages = std::collections::HashMap::new();
+        for rule in service.mapping_rules() {
+            debug!("matching pat {} against rule {:#?}", pattern.as_str(), rule);
+            if rule.is_match(&method, pattern.as_str()) {
+                debug!("matched pattern in {}", pattern);
+                for usage in rule.usages() {
+                    let value = usages.entry(usage.name()).or_insert(0);
+                    *value += usage.delta();
+                }
+            }
+        }
+
+        if usages.is_empty() {
+            anyhow::bail!(authrep::MatchError::NoUsageMatch);
+        }
+
+        // Adding threescale info as request headers
+        self.add_http_request_header("x-3scale-service-id", service.id());
+        self.add_http_request_header("x-3scale-service-token", service.token());
+        self.add_http_request_header(key_header[0], key_header[1]);
+        self.add_http_request_header("x-3scale-usages", &serde_json::to_string(&usages)?);
+        Ok(())
     }
 }
 
